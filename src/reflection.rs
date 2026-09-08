@@ -1,5 +1,6 @@
 use super::GrpcConnection;
 use anyhow::{Context, Result};
+use base64::Engine;
 use command_utils::protobuf::ProtobufDescriptor;
 use futures::stream::StreamExt;
 use prost::Message;
@@ -27,6 +28,40 @@ struct DescriptorCache {
     file_descriptors: HashMap<String, FileDescriptorProto>,
 }
 
+fn apply_metadata<T>(metadata: &HashMap<String, String>, request: &mut tonic::Request<T>) {
+    for (key, value) in metadata {
+        if key.ends_with("-bin") {
+            let Ok(key) =
+                tonic::metadata::MetadataKey::<tonic::metadata::Binary>::from_bytes(key.as_bytes())
+            else {
+                tracing::warn!(metadata_key = %key, "ignoring invalid reflection metadata key");
+                continue;
+            };
+            let Ok(value) = base64::engine::general_purpose::STANDARD.decode(value) else {
+                tracing::warn!(metadata_key = %key, "ignoring invalid binary reflection metadata value");
+                continue;
+            };
+            request
+                .metadata_mut()
+                .insert_bin(key, tonic::metadata::MetadataValue::from_bytes(&value));
+        } else {
+            let Ok(key) =
+                tonic::metadata::MetadataKey::<tonic::metadata::Ascii>::from_bytes(key.as_bytes())
+            else {
+                tracing::warn!(metadata_key = %key, "ignoring invalid reflection metadata key");
+                continue;
+            };
+            let Ok(value) =
+                tonic::metadata::MetadataValue::<tonic::metadata::Ascii>::try_from(value.as_str())
+            else {
+                tracing::warn!(metadata_key = %key, "ignoring invalid reflection metadata value");
+                continue;
+            };
+            request.metadata_mut().insert(key, value);
+        }
+    }
+}
+
 // We'll be working with descriptors via references/handles - no direct dependency on prost_reflect
 
 #[derive(Debug, Clone)]
@@ -34,6 +69,7 @@ pub struct GrpcReflectionClient {
     pub address: String,
     pub request_timeout: Option<Duration>,
     connection: GrpcConnection,
+    metadata: HashMap<String, String>,
     // Cache for descriptor resolution - wrapped in Arc<RwLock> for interior mutability and thread safety
     descriptor_cache: Arc<RwLock<DescriptorCache>>,
 }
@@ -45,6 +81,7 @@ impl GrpcReflectionClient {
             address: addr,
             request_timeout,
             connection: con,
+            metadata: HashMap::new(),
             descriptor_cache: Arc::new(RwLock::new(DescriptorCache::default())),
         })
     }
@@ -52,6 +89,7 @@ impl GrpcReflectionClient {
         endpoint: Endpoint,
         channel: Channel,
         request_timeout: Option<Duration>,
+        metadata: HashMap<String, String>,
     ) -> Result<Self> {
         let address = endpoint.uri().to_string();
         let con = GrpcConnection::create(endpoint, channel).await?;
@@ -59,6 +97,7 @@ impl GrpcReflectionClient {
             address,
             request_timeout,
             connection: con,
+            metadata,
             descriptor_cache: Arc::new(RwLock::new(DescriptorCache::default())),
         })
     }
@@ -69,6 +108,10 @@ impl GrpcReflectionClient {
     pub async fn reflection_client(&self) -> ServerReflectionClient<tonic::transport::Channel> {
         let cell = self.connection.read_channel().await;
         ServerReflectionClient::new(cell.clone())
+    }
+
+    fn apply_metadata<T>(&self, request: &mut tonic::Request<T>) {
+        apply_metadata(&self.metadata, request);
     }
 
     /// Get a list of services from the server using the reflection API
@@ -82,10 +125,10 @@ impl GrpcReflectionClient {
         };
 
         // Send the request and receive the response
+        let mut request = tonic::Request::new(futures::stream::iter(vec![list_services_request]));
+        self.apply_metadata(&mut request);
         let mut stream = client
-            .server_reflection_info(tonic::Request::new(futures::stream::iter(vec![
-                list_services_request,
-            ])))
+            .server_reflection_info(request)
             .await
             .context("Failed to call server_reflection_info")?
             .into_inner();
@@ -238,10 +281,10 @@ impl GrpcReflectionClient {
                 message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
             };
 
+            let mut request = tonic::Request::new(futures::stream::iter(vec![symbol_request]));
+            self.apply_metadata(&mut request);
             let mut stream = client
-                .server_reflection_info(tonic::Request::new(futures::stream::iter(vec![
-                    symbol_request,
-                ])))
+                .server_reflection_info(request)
                 .await
                 .context("Failed to call server_reflection_info for recursive descriptor")?
                 .into_inner();
@@ -359,10 +402,10 @@ impl GrpcReflectionClient {
             message_request: Some(MessageRequest::FileByFilename(file_name.to_string())),
         };
 
+        let mut request = tonic::Request::new(futures::stream::iter(vec![file_request]));
+        self.apply_metadata(&mut request);
         let mut stream = client
-            .server_reflection_info(tonic::Request::new(futures::stream::iter(vec![
-                file_request,
-            ])))
+            .server_reflection_info(request)
             .await
             .context(format!("Failed to fetch file descriptor for {file_name}"))?
             .into_inner();
@@ -641,6 +684,37 @@ pub trait UseServerReflectionClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reflection_metadata_preserves_binary_values() {
+        let metadata = HashMap::from([
+            ("trace-bin".to_string(), "AAEC/w==".to_string()),
+            ("request-id".to_string(), "abc".to_string()),
+        ]);
+        let mut request = tonic::Request::new(());
+
+        apply_metadata(&metadata, &mut request);
+
+        assert_eq!(
+            request
+                .metadata()
+                .get_bin("trace-bin")
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+                .as_ref(),
+            b"\x00\x01\x02\xff"
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get("request-id")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "abc"
+        );
+    }
     use anyhow::Result;
     use std::time::Duration;
 

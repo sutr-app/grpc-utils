@@ -9,6 +9,7 @@ default = []
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 axum = { version = "0.8" }
 command-utils = { git = "https://github.com/sutr-app/command-utils.git", branch = "main" }
 futures = "0.3"
