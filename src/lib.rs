@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use axum::http::{HeaderName, HeaderValue, Method};
 use prost::bytes::{Buf, BufMut};
 use std::convert::Infallible;
 use std::{sync::Arc, time::Duration};
@@ -10,8 +11,8 @@ use tonic::service::LayerExt as _;
 use tonic::transport::{ClientTlsConfig, Endpoint};
 use tonic_web::GrpcWebService;
 use tower::Service;
-use tower_http::cors::Cors;
-use tower_http::cors::CorsLayer;
+use tower::util::Either;
+use tower_http::cors::{AllowOrigin, Cors, CorsLayer};
 
 pub mod reflection;
 
@@ -111,7 +112,69 @@ impl Codec for RawBytesCodec {
     }
 }
 
-pub fn enable_grpc_web<S>(service: S) -> tonic::service::Layered<Cors<GrpcWebService<S>>, S>
+/// Origins allowed to call the gRPC-Web endpoints from a browser.
+#[derive(Debug, Clone, Default)]
+pub enum GrpcWebCorsOrigins {
+    /// No CORS headers are returned, so browsers reject cross-origin calls.
+    #[default]
+    Disabled,
+    /// Every origin is allowed (development only).
+    Any,
+    List(Vec<HeaderValue>),
+}
+
+impl GrpcWebCorsOrigins {
+    /// Parses a comma separated origin list. Empty means `Disabled`, `*` means `Any`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let items: Vec<&str> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        match items.as_slice() {
+            [] => Ok(Self::Disabled),
+            ["*"] => Ok(Self::Any),
+            _ if items.contains(&"*") => {
+                anyhow::bail!("'*' cannot be combined with other origins: {value}")
+            }
+            _ => items
+                .into_iter()
+                .map(|o| HeaderValue::from_str(o).with_context(|| format!("invalid origin: {o}")))
+                .collect::<Result<Vec<_>>>()
+                .map(Self::List),
+        }
+    }
+
+    fn cors_layer(&self) -> Option<CorsLayer> {
+        match self {
+            Self::Disabled => None,
+            Self::Any => Some(CorsLayer::permissive()),
+            Self::List(origins) => Some(
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(origins.clone()))
+                    .allow_methods([Method::POST, Method::OPTIONS])
+                    .allow_headers([
+                        HeaderName::from_static("x-grpc-web"),
+                        HeaderName::from_static("x-user-agent"),
+                        HeaderName::from_static("content-type"),
+                        HeaderName::from_static("grpc-timeout"),
+                        HeaderName::from_static("authorization"),
+                    ])
+                    .expose_headers([
+                        HeaderName::from_static("grpc-status"),
+                        HeaderName::from_static("grpc-message"),
+                        HeaderName::from_static("grpc-status-details-bin"),
+                    ])
+                    .max_age(Duration::from_secs(24 * 60 * 60)),
+            ),
+        }
+    }
+}
+
+pub fn enable_grpc_web<S>(
+    service: S,
+    origins: &GrpcWebCorsOrigins,
+) -> tonic::service::Layered<Either<Cors<GrpcWebService<S>>, GrpcWebService<S>>, S>
 where
     S: Service<axum::http::Request<Body>, Error = Infallible>
         + NamedService
@@ -123,7 +186,7 @@ where
     S::Future: Send + 'static,
 {
     tower::ServiceBuilder::new()
-        .layer(CorsLayer::permissive())
+        .option_layer(origins.cors_layer())
         .layer(tonic_web::GrpcWebLayer::new())
         .into_inner()
         .named_layer(service)
@@ -156,5 +219,121 @@ mod tests {
         let connection = GrpcConnection::create(endpoint, channel).await.unwrap();
 
         let _channel = connection.read_channel().await;
+    }
+
+    #[derive(Clone)]
+    struct EchoService;
+
+    impl NamedService for EchoService {
+        const NAME: &'static str = "test.Echo";
+    }
+
+    impl Service<axum::http::Request<Body>> for EchoService {
+        type Response = axum::http::Response<Body>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Infallible>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: axum::http::Request<Body>) -> Self::Future {
+            std::future::ready(Ok(axum::http::Response::new(Body::empty())))
+        }
+    }
+
+    async fn allow_origin_header(origins: &str, method: Method, origin: &str) -> Option<String> {
+        use tower::ServiceExt;
+        let mut svc = enable_grpc_web(EchoService, &GrpcWebCorsOrigins::parse(origins).unwrap());
+        let mut req = axum::http::Request::builder()
+            .method(method.clone())
+            .uri("/test.Echo/Call")
+            .header("origin", origin)
+            .header("content-type", "application/grpc-web+proto");
+        if method == Method::OPTIONS {
+            req = req
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "x-grpc-web,content-type");
+        }
+        let res = ServiceExt::<axum::http::Request<Body>>::ready(&mut svc)
+            .await
+            .unwrap()
+            .call(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        res.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn parse_handles_empty_wildcard_and_lists() {
+        assert!(matches!(
+            GrpcWebCorsOrigins::parse("").unwrap(),
+            GrpcWebCorsOrigins::Disabled
+        ));
+        assert!(matches!(
+            GrpcWebCorsOrigins::parse("  , ").unwrap(),
+            GrpcWebCorsOrigins::Disabled
+        ));
+        assert!(matches!(
+            GrpcWebCorsOrigins::parse(" * ").unwrap(),
+            GrpcWebCorsOrigins::Any
+        ));
+        match GrpcWebCorsOrigins::parse(" http://a.example , http://b.example, ").unwrap() {
+            GrpcWebCorsOrigins::List(v) => assert_eq!(v.len(), 2),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_values() {
+        assert!(GrpcWebCorsOrigins::parse("*,http://a.example").is_err());
+        assert!(GrpcWebCorsOrigins::parse("http://a.example,*").is_err());
+        assert!(GrpcWebCorsOrigins::parse("http://a\nb").is_err());
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_gets_cors_headers_on_preflight_and_post() {
+        for method in [Method::OPTIONS, Method::POST] {
+            assert_eq!(
+                allow_origin_header("http://a.example", method, "http://a.example")
+                    .await
+                    .as_deref(),
+                Some("http://a.example")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disallowed_origin_gets_no_cors_header() {
+        for method in [Method::OPTIONS, Method::POST] {
+            assert_eq!(
+                allow_origin_header("http://a.example", method, "http://evil.example").await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_does_not_allow_any_origin() {
+        for method in [Method::OPTIONS, Method::POST] {
+            assert_eq!(
+                allow_origin_header("", method, "http://evil.example").await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_allows_every_origin() {
+        assert!(
+            allow_origin_header("*", Method::POST, "http://any.example")
+                .await
+                .is_some()
+        );
     }
 }
