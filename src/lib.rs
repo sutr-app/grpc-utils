@@ -183,10 +183,54 @@ impl GrpcWebCorsOrigins {
     }
 }
 
-pub fn enable_grpc_web<S>(
-    service: S,
-    origins: &GrpcWebCorsOrigins,
-) -> tonic::service::Layered<Either<Cors<GrpcWebService<S>>, GrpcWebService<S>>, S>
+/// Rejects requests whose content type is not gRPC or gRPC-Web with 415.
+///
+/// CORS only hides responses: browsers send `text/plain` POSTs without a preflight, and
+/// over HTTP/2 (e.g. behind a TLS proxy) tonic-web passes them to tonic, which does not
+/// check the content type, so the RPC would run for any website.
+#[derive(Debug, Clone)]
+pub struct RequireGrpcContentType<S> {
+    inner: S,
+}
+
+impl<S, B> Service<axum::http::Request<B>> for RequireGrpcContentType<S>
+where
+    S: Service<axum::http::Request<B>, Response = axum::http::Response<Body>>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        futures::future::Either<S::Future, std::future::Ready<Result<Self::Response, Self::Error>>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        let is_grpc = req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+        if is_grpc {
+            futures::future::Either::Left(self.inner.call(req))
+        } else {
+            let mut res = axum::http::Response::new(Body::empty());
+            *res.status_mut() = axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE;
+            futures::future::Either::Right(std::future::ready(Ok(res)))
+        }
+    }
+}
+
+type GuardedGrpcWeb<S> = RequireGrpcContentType<GrpcWebService<S>>;
+
+pub type GrpcWebEnabled<S> =
+    tonic::service::Layered<Either<Cors<GuardedGrpcWeb<S>>, GuardedGrpcWeb<S>>, S>;
+
+pub fn enable_grpc_web<S>(service: S, origins: &GrpcWebCorsOrigins) -> GrpcWebEnabled<S>
 where
     S: Service<axum::http::Request<Body>, Error = Infallible>
         + NamedService
@@ -199,6 +243,7 @@ where
 {
     tower::ServiceBuilder::new()
         .option_layer(origins.cors_layer())
+        .layer_fn(|inner| RequireGrpcContentType { inner })
         .layer(tonic_web::GrpcWebLayer::new())
         .into_inner()
         .named_layer(service)
@@ -428,5 +473,59 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    async fn status_for(
+        origins: &str,
+        version: axum::http::Version,
+        content_type: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .version(version)
+            .uri("/test.Echo/Call")
+            .header("origin", "http://evil.example")
+            .header("content-type", content_type)
+            .body(Body::empty())
+            .unwrap();
+        enable_grpc_web(EchoService, &GrpcWebCorsOrigins::parse(origins).unwrap())
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    // Browsers send text/plain POSTs without a preflight, and over HTTP/2 (TLS proxies)
+    // tonic-web hands non-grpc-web requests straight to the service.
+    #[tokio::test]
+    async fn non_grpc_content_type_never_reaches_the_service() {
+        for origins in ["http://a.example", "", "*"] {
+            for version in [axum::http::Version::HTTP_11, axum::http::Version::HTTP_2] {
+                for content_type in ["text/plain", "application/x-www-form-urlencoded"] {
+                    assert_ne!(
+                        status_for(origins, version, content_type).await,
+                        axum::http::StatusCode::OK,
+                        "origins={origins:?} {version:?} {content_type}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_and_grpc_web_content_types_reach_the_service() {
+        for (version, content_type) in [
+            (axum::http::Version::HTTP_2, "application/grpc"),
+            (axum::http::Version::HTTP_2, "application/grpc+proto"),
+            (axum::http::Version::HTTP_11, "application/grpc-web+proto"),
+            (axum::http::Version::HTTP_11, "application/grpc-web-text"),
+        ] {
+            assert_eq!(
+                status_for("", version, content_type).await,
+                axum::http::StatusCode::OK,
+                "{version:?} {content_type}"
+            );
+        }
     }
 }
