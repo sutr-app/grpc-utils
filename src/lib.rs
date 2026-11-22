@@ -113,7 +113,7 @@ impl Codec for RawBytesCodec {
 }
 
 /// Origins allowed to call the gRPC-Web endpoints from a browser.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum GrpcWebCorsOrigins {
     /// No CORS headers are returned, so browsers reject cross-origin calls.
     #[default]
@@ -165,20 +165,21 @@ impl GrpcWebCorsOrigins {
     }
 
     fn cors_layer(&self) -> Option<CorsLayer> {
-        match self {
-            Self::Disabled => None,
-            Self::Any => Some(CorsLayer::permissive()),
-            // gRPC metadata travels as arbitrary headers (auth tokens, trace context,
-            // `*-bin` response metadata), so only the origin is restricted.
-            Self::List(origins) => Some(
-                CorsLayer::new()
-                    .allow_origin(AllowOrigin::list(origins.clone()))
-                    .allow_methods([Method::POST])
-                    .allow_headers(AllowHeaders::mirror_request())
-                    .expose_headers(ExposeHeaders::any())
-                    .max_age(Duration::from_secs(24 * 60 * 60)),
-            ),
-        }
+        let allow_origin = match self {
+            Self::Disabled => return None,
+            Self::Any => AllowOrigin::any(),
+            Self::List(origins) => AllowOrigin::list(origins.clone()),
+        };
+        // gRPC metadata travels as arbitrary headers (auth tokens, trace context,
+        // `*-bin` response metadata), so only the origin is restricted.
+        Some(
+            CorsLayer::new()
+                .allow_origin(allow_origin)
+                .allow_methods([Method::POST])
+                .allow_headers(AllowHeaders::mirror_request())
+                .expose_headers(ExposeHeaders::any())
+                .max_age(Duration::from_secs(24 * 60 * 60)),
+        )
     }
 }
 
@@ -265,24 +266,23 @@ mod tests {
         request_headers: &str,
     ) -> axum::http::HeaderMap {
         use tower::ServiceExt;
-        let mut svc = enable_grpc_web(EchoService, &GrpcWebCorsOrigins::parse(origins).unwrap());
+        let is_preflight = method == Method::OPTIONS;
         let mut req = axum::http::Request::builder()
-            .method(method.clone())
+            .method(method)
             .uri("/test.Echo/Call")
             .header("origin", origin)
             .header("content-type", "application/grpc-web+proto");
-        if method == Method::OPTIONS {
+        if is_preflight {
             req = req
                 .header("access-control-request-method", "POST")
                 .header("access-control-request-headers", request_headers);
         }
-        let res = ServiceExt::<axum::http::Request<Body>>::ready(&mut svc)
+        enable_grpc_web(EchoService, &GrpcWebCorsOrigins::parse(origins).unwrap())
+            .oneshot(req.body(Body::empty()).unwrap())
             .await
             .unwrap()
-            .call(req.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        res.headers().clone()
+            .headers()
+            .clone()
     }
 
     async fn allow_origin_header(origins: &str, method: Method, origin: &str) -> Option<String> {
@@ -292,41 +292,39 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
     }
 
-    fn list_of(value: &str) -> Vec<HeaderValue> {
-        match GrpcWebCorsOrigins::parse(value).unwrap() {
-            GrpcWebCorsOrigins::List(v) => v,
-            other => panic!("unexpected: {other:?}"),
-        }
+    fn list_of(origins: &[&'static str]) -> GrpcWebCorsOrigins {
+        GrpcWebCorsOrigins::List(
+            origins
+                .iter()
+                .map(|o| HeaderValue::from_static(o))
+                .collect(),
+        )
     }
 
     #[test]
     fn parse_handles_empty_wildcard_and_lists() {
-        assert!(matches!(
-            GrpcWebCorsOrigins::parse("").unwrap(),
-            GrpcWebCorsOrigins::Disabled
-        ));
-        assert!(matches!(
-            GrpcWebCorsOrigins::parse("  , ").unwrap(),
-            GrpcWebCorsOrigins::Disabled
-        ));
-        assert!(matches!(
-            GrpcWebCorsOrigins::parse(" * ").unwrap(),
-            GrpcWebCorsOrigins::Any
-        ));
-        assert_eq!(
-            list_of(" http://a.example , https://b.example:8443, "),
-            vec![
-                HeaderValue::from_static("http://a.example"),
-                HeaderValue::from_static("https://b.example:8443"),
-            ]
-        );
+        for (value, expected) in [
+            ("", GrpcWebCorsOrigins::Disabled),
+            ("  , ", GrpcWebCorsOrigins::Disabled),
+            (" * ", GrpcWebCorsOrigins::Any),
+            (
+                " http://a.example , https://b.example:8443, ",
+                list_of(&["http://a.example", "https://b.example:8443"]),
+            ),
+        ] {
+            assert_eq!(
+                GrpcWebCorsOrigins::parse(value).unwrap(),
+                expected,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
     fn parse_lowercases_origins_to_match_browser_serialization() {
         assert_eq!(
-            list_of("HTTP://A.Example:5173"),
-            vec![HeaderValue::from_static("http://a.example:5173")]
+            GrpcWebCorsOrigins::parse("HTTP://A.Example:5173").unwrap(),
+            list_of(&["http://a.example:5173"])
         );
     }
 
@@ -366,58 +364,60 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_origin_preflight_accepts_custom_metadata_headers() {
-        let headers = cors_response_headers(
-            "http://a.example",
-            Method::OPTIONS,
-            "http://a.example",
-            "x-grpc-web,content-type,jobworkerp-auth,traceparent",
-        )
-        .await;
-        let allowed = headers
-            .get("access-control-allow-headers")
-            .expect("allow-headers must be returned")
-            .to_str()
-            .unwrap()
-            .to_ascii_lowercase();
-        for name in [
-            "x-grpc-web",
-            "content-type",
-            "jobworkerp-auth",
-            "traceparent",
-        ] {
-            assert!(allowed.contains(name), "{name} not allowed: {allowed}");
+        for origins in ["http://a.example", "*"] {
+            let headers = cors_response_headers(
+                origins,
+                Method::OPTIONS,
+                "http://a.example",
+                "x-grpc-web,content-type,jobworkerp-auth,traceparent",
+            )
+            .await;
+            let allowed = headers
+                .get("access-control-allow-headers")
+                .expect("allow-headers must be returned")
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase();
+            for name in [
+                "x-grpc-web",
+                "content-type",
+                "jobworkerp-auth",
+                "traceparent",
+            ] {
+                assert!(
+                    allowed.contains(name),
+                    "{origins}: {name} not allowed: {allowed}"
+                );
+            }
         }
     }
 
     #[tokio::test]
     async fn allowed_origin_response_exposes_metadata_headers() {
-        let headers =
-            cors_response_headers("http://a.example", Method::POST, "http://a.example", "").await;
-        assert_eq!(
-            headers
-                .get("access-control-expose-headers")
-                .map(|v| v.to_str().unwrap()),
-            Some("*")
-        );
-    }
-
-    #[tokio::test]
-    async fn disallowed_origin_gets_no_cors_header() {
-        for method in [Method::OPTIONS, Method::POST] {
+        for origins in ["http://a.example", "*"] {
+            let headers =
+                cors_response_headers(origins, Method::POST, "http://a.example", "").await;
             assert_eq!(
-                allow_origin_header("http://a.example", method, "http://evil.example").await,
-                None
+                headers
+                    .get("access-control-expose-headers")
+                    .map(|v| v.to_str().unwrap()),
+                Some("*"),
+                "{origins}"
             );
         }
     }
 
     #[tokio::test]
-    async fn disabled_does_not_allow_any_origin() {
-        for method in [Method::OPTIONS, Method::POST] {
-            assert_eq!(
-                allow_origin_header("", method, "http://evil.example").await,
-                None
-            );
+    async fn unlisted_origin_gets_no_cors_header() {
+        // "" (unset) must reject too, rather than fall back to allowing every origin.
+        for origins in ["http://a.example", ""] {
+            for method in [Method::OPTIONS, Method::POST] {
+                assert_eq!(
+                    allow_origin_header(origins, method, "http://evil.example").await,
+                    None,
+                    "origins={origins:?}"
+                );
+            }
         }
     }
 
