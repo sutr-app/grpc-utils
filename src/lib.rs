@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::http::{HeaderValue, Method};
 use prost::bytes::{Buf, BufMut};
 use std::convert::Infallible;
 use std::{sync::Arc, time::Duration};
@@ -12,7 +12,7 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 use tonic_web::GrpcWebService;
 use tower::Service;
 use tower::util::Either;
-use tower_http::cors::{AllowOrigin, Cors, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowOrigin, Cors, CorsLayer, ExposeHeaders};
 
 pub mod reflection;
 
@@ -120,11 +120,15 @@ pub enum GrpcWebCorsOrigins {
     Disabled,
     /// Every origin is allowed (development only).
     Any,
+    /// Only these origins (`scheme://host[:port]`, lowercase) are allowed.
     List(Vec<HeaderValue>),
 }
 
 impl GrpcWebCorsOrigins {
     /// Parses a comma separated origin list. Empty means `Disabled`, `*` means `Any`.
+    ///
+    /// Each origin must be `http(s)://host[:port]` without a path, because browsers send
+    /// exactly that form in the `Origin` header and anything else would never match.
     pub fn parse(value: &str) -> Result<Self> {
         let items: Vec<&str> = value
             .split(',')
@@ -139,32 +143,39 @@ impl GrpcWebCorsOrigins {
             }
             _ => items
                 .into_iter()
-                .map(|o| HeaderValue::from_str(o).with_context(|| format!("invalid origin: {o}")))
+                .map(Self::parse_origin)
                 .collect::<Result<Vec<_>>>()
                 .map(Self::List),
         }
+    }
+
+    fn parse_origin(origin: &str) -> Result<HeaderValue> {
+        // Scheme and host are case-insensitive, and browsers serialize them in lowercase.
+        let normalized = origin.to_ascii_lowercase();
+        let authority = normalized
+            .strip_prefix("http://")
+            .or_else(|| normalized.strip_prefix("https://"))
+            .with_context(|| format!("origin must start with http:// or https://: {origin}"))?;
+        if authority.is_empty()
+            || authority.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
+        {
+            anyhow::bail!("origin must be scheme://host[:port] without a path: {origin}");
+        }
+        HeaderValue::from_str(&normalized).with_context(|| format!("invalid origin: {origin}"))
     }
 
     fn cors_layer(&self) -> Option<CorsLayer> {
         match self {
             Self::Disabled => None,
             Self::Any => Some(CorsLayer::permissive()),
+            // gRPC metadata travels as arbitrary headers (auth tokens, trace context,
+            // `*-bin` response metadata), so only the origin is restricted.
             Self::List(origins) => Some(
                 CorsLayer::new()
                     .allow_origin(AllowOrigin::list(origins.clone()))
-                    .allow_methods([Method::POST, Method::OPTIONS])
-                    .allow_headers([
-                        HeaderName::from_static("x-grpc-web"),
-                        HeaderName::from_static("x-user-agent"),
-                        HeaderName::from_static("content-type"),
-                        HeaderName::from_static("grpc-timeout"),
-                        HeaderName::from_static("authorization"),
-                    ])
-                    .expose_headers([
-                        HeaderName::from_static("grpc-status"),
-                        HeaderName::from_static("grpc-message"),
-                        HeaderName::from_static("grpc-status-details-bin"),
-                    ])
+                    .allow_methods([Method::POST])
+                    .allow_headers(AllowHeaders::mirror_request())
+                    .expose_headers(ExposeHeaders::any())
                     .max_age(Duration::from_secs(24 * 60 * 60)),
             ),
         }
@@ -245,7 +256,14 @@ mod tests {
         }
     }
 
-    async fn allow_origin_header(origins: &str, method: Method, origin: &str) -> Option<String> {
+    const GRPC_WEB_REQUEST_HEADERS: &str = "x-grpc-web,content-type";
+
+    async fn cors_response_headers(
+        origins: &str,
+        method: Method,
+        origin: &str,
+        request_headers: &str,
+    ) -> axum::http::HeaderMap {
         use tower::ServiceExt;
         let mut svc = enable_grpc_web(EchoService, &GrpcWebCorsOrigins::parse(origins).unwrap());
         let mut req = axum::http::Request::builder()
@@ -256,7 +274,7 @@ mod tests {
         if method == Method::OPTIONS {
             req = req
                 .header("access-control-request-method", "POST")
-                .header("access-control-request-headers", "x-grpc-web,content-type");
+                .header("access-control-request-headers", request_headers);
         }
         let res = ServiceExt::<axum::http::Request<Body>>::ready(&mut svc)
             .await
@@ -264,9 +282,21 @@ mod tests {
             .call(req.body(Body::empty()).unwrap())
             .await
             .unwrap();
-        res.headers()
+        res.headers().clone()
+    }
+
+    async fn allow_origin_header(origins: &str, method: Method, origin: &str) -> Option<String> {
+        cors_response_headers(origins, method, origin, GRPC_WEB_REQUEST_HEADERS)
+            .await
             .get("access-control-allow-origin")
             .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    fn list_of(value: &str) -> Vec<HeaderValue> {
+        match GrpcWebCorsOrigins::parse(value).unwrap() {
+            GrpcWebCorsOrigins::List(v) => v,
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -283,17 +313,43 @@ mod tests {
             GrpcWebCorsOrigins::parse(" * ").unwrap(),
             GrpcWebCorsOrigins::Any
         ));
-        match GrpcWebCorsOrigins::parse(" http://a.example , http://b.example, ").unwrap() {
-            GrpcWebCorsOrigins::List(v) => assert_eq!(v.len(), 2),
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert_eq!(
+            list_of(" http://a.example , https://b.example:8443, "),
+            vec![
+                HeaderValue::from_static("http://a.example"),
+                HeaderValue::from_static("https://b.example:8443"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_lowercases_origins_to_match_browser_serialization() {
+        assert_eq!(
+            list_of("HTTP://A.Example:5173"),
+            vec![HeaderValue::from_static("http://a.example:5173")]
+        );
     }
 
     #[test]
     fn parse_rejects_invalid_values() {
-        assert!(GrpcWebCorsOrigins::parse("*,http://a.example").is_err());
-        assert!(GrpcWebCorsOrigins::parse("http://a.example,*").is_err());
-        assert!(GrpcWebCorsOrigins::parse("http://a\nb").is_err());
+        for value in [
+            "*,http://a.example",
+            "http://a.example,*",
+            "http://a\nb",
+            // A browser never sends a path or trailing slash in Origin, so these would never match.
+            "http://a.example/",
+            "http://a.example/admin",
+            "http://a.example?x=1",
+            "http://a.example#x",
+            "a.example",
+            "ftp://a.example",
+            "http://",
+        ] {
+            assert!(
+                GrpcWebCorsOrigins::parse(value).is_err(),
+                "expected error for {value:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -306,6 +362,43 @@ mod tests {
                 Some("http://a.example")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_preflight_accepts_custom_metadata_headers() {
+        let headers = cors_response_headers(
+            "http://a.example",
+            Method::OPTIONS,
+            "http://a.example",
+            "x-grpc-web,content-type,jobworkerp-auth,traceparent",
+        )
+        .await;
+        let allowed = headers
+            .get("access-control-allow-headers")
+            .expect("allow-headers must be returned")
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for name in [
+            "x-grpc-web",
+            "content-type",
+            "jobworkerp-auth",
+            "traceparent",
+        ] {
+            assert!(allowed.contains(name), "{name} not allowed: {allowed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_response_exposes_metadata_headers() {
+        let headers =
+            cors_response_headers("http://a.example", Method::POST, "http://a.example", "").await;
+        assert_eq!(
+            headers
+                .get("access-control-expose-headers")
+                .map(|v| v.to_str().unwrap()),
+            Some("*")
+        );
     }
 
     #[tokio::test]
